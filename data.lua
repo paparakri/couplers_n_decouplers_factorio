@@ -39,7 +39,8 @@ local docking_port_entity = {
   name = "docking-port",
   icon = placeholder_icon,
   icon_size = placeholder_icon_size,
-  flags = { "placeable-neutral", "player-creation" },
+  -- get-by-unit-number lets scripts resolve ports with game.get_entity_by_unit_number.
+  flags = { "placeable-neutral", "player-creation", "get-by-unit-number" },
   minable = { mining_time = 0.5, result = "docking-port" },
   max_health = 200,
   corpse = "small-remnants",
@@ -104,8 +105,8 @@ local corridor_tile = {
 
 -- ---------------------------------------------------------------------------
 -- 4. Hub overlay entity (platform-docking-hub-overlay)
--- Purely visual — placed over Platform B's hub during docking to show it's inert.
--- No collision, no inventory. Created/destroyed by scripts/merger.lua (Step 4).
+-- Purely visual — marks where Platform B's hub sits in B's layout while docked
+-- (the real hub stays on B's own surface). Created/destroyed by scripts/merger.lua.
 -- ---------------------------------------------------------------------------
 local hub_overlay_entity = {
   type = "simple-entity",

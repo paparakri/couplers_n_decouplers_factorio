@@ -1,116 +1,84 @@
 -- scripts/corridor.lua
--- Places and removes the bridge tiles between two docking ports.
+-- Computes, places and removes the bridge tiles between two docking ports.
 --
 -- Corridor geometry:
---   Port A faces a cardinal direction (north/east/south/west).
---   The corridor tiles fill the gap between Port A's tile and Port B's tile
---   along that axis (both port tiles themselves are excluded).
---   Width is 1 tile for now; can be widened in Step 5.
---
--- Tile removal:
---   Factorio has no "delete tile" API on platform surfaces. On undock, corridor
---   tiles revert to space-platform-foundation. They sit at A's outer edge, so
---   the player can mine them manually if desired.
+--   Port A faces a cardinal direction. The corridor fills the tiles strictly
+--   between port A's tile and port B's (post-offset) tile along that axis.
+--   Length and width are chosen per dock in the port GUI (defaults from the
+--   docking-corridor-length / docking-corridor-width settings).
 
 local Corridor = {}
 
-local DIRECTION_VECTOR = {
+Corridor.DIRECTION_VECTOR = {
   [defines.direction.north] = { x =  0, y = -1 },
   [defines.direction.east]  = { x =  1, y =  0 },
   [defines.direction.south] = { x =  0, y =  1 },
   [defines.direction.west]  = { x = -1, y =  0 },
 }
 
--- ---------------------------------------------------------------------------
--- Public API
--- ---------------------------------------------------------------------------
+-- Limits for the player-chosen corridor size (settings use the same bounds).
+Corridor.MAX_LENGTH = 10
+Corridor.MAX_WIDTH  = 9
 
---- Place corridor tiles between port_a and where port_b will land on A's surface.
---- Fills pair.corridor_tiles with the placed positions.
----
----@param pair          table        docked pair record (from storage.docked_pairs)
----@param surface       LuaSurface   platform A's surface
----@param port_b_new_pos table       {x, y} — port_b's position after the offset is applied
----@return boolean      success
----@return string|nil   err          human-readable reason on failure
-function Corridor.place_bridge(pair, surface, port_b_new_pos)
-  local port_a = surface.find_entities_filtered{ unit_number = pair.port_a_unit }[1]
-  if not (port_a and port_a.valid) then
-    return false, "Port A not found on platform A's surface."
-  end
-
-  local vec = DIRECTION_VECTOR[port_a.direction]
-  if not vec then
-    return false, "Port A has an unsupported direction."
-  end
-
-  -- Integer tile coordinates (1×1 entities: tile = floor of centre position).
-  local pa = { x = math.floor(port_a.position.x), y = math.floor(port_a.position.y) }
-  local pb = { x = math.floor(port_b_new_pos.x),  y = math.floor(port_b_new_pos.y)  }
-
-  -- Total step count from pa to pb along the corridor axis.
-  local total_steps
-  if vec.x ~= 0 then
-    total_steps = math.abs(pb.x - pa.x)
-  else
-    total_steps = math.abs(pb.y - pa.y)
-  end
-
-  -- Tiles strictly between the two port tiles.
-  local corridor_len = total_steps - 1
-
-  if corridor_len <= 0 then
-    -- Ports are directly adjacent; no gap tiles required.
-    pair.corridor_tiles = {}
-    return true, nil
-  end
-
-  local max_len = settings.global["max-corridor-length"].value
-  if corridor_len > max_len then
-    return false, string.format(
-      "Platforms are too far apart to dock (%d-tile gap, max %d).",
-      corridor_len, max_len)
-  end
-
-  -- Build and place.
-  local tiles_to_set  = {}
-  pair.corridor_tiles = {}
-
-  for i = 1, corridor_len do
-    local pos = { x = pa.x + vec.x * i, y = pa.y + vec.y * i }
-    table.insert(tiles_to_set,   { name = "platform-docking-corridor", position = pos })
-    table.insert(pair.corridor_tiles, { x = pos.x, y = pos.y })
-  end
-
-  surface.set_tiles(tiles_to_set)
-
-  log(string.format("[Corridor] Placed %d corridor tile(s) from (%d,%d) toward (%d,%d).",
-    corridor_len, pa.x, pa.y, pb.x, pb.y))
-
-  return true, nil
+--- Clamp a requested size to whole numbers within limits.
+---@param length number|nil
+---@param width number|nil
+---@return number length, number width
+function Corridor.clamp(length, width)
+  length = math.floor(tonumber(length) or settings.global["docking-corridor-length"].value)
+  width  = math.floor(tonumber(width)  or settings.global["docking-corridor-width"].value)
+  return math.max(1, math.min(length, Corridor.MAX_LENGTH)),
+         math.max(1, math.min(width, Corridor.MAX_WIDTH))
 end
 
---- Remove the corridor tiles placed by place_bridge.
---- Must be called AFTER all entities on corridor tiles have been destroyed,
---- as platform tiles with entities on them cannot be removed.
---- Corridor tiles revert to space-platform-foundation (mineable by the player).
----
----@param pair    table       docked pair record
----@param surface LuaSurface  platform A's surface
-function Corridor.remove_bridge(pair, surface)
-  if not (pair.corridor_tiles and #pair.corridor_tiles > 0) then return end
-
-  local tiles_to_set = {}
-  for _, pos in ipairs(pair.corridor_tiles) do
-    table.insert(tiles_to_set, { name = "space-platform-foundation", position = pos })
+--- Tiles between the two ports: `length` tiles out from port A's tile,
+--- `width` tiles across, centred on the ports' row/column.
+---@param direction defines.direction  port A's facing direction
+---@param a_tile table  {x, y} port A's tile
+---@param length number
+---@param width number
+---@return table[] tiles
+function Corridor.tiles_between(direction, a_tile, length, width)
+  local vec  = Corridor.DIRECTION_VECTOR[direction]
+  local perp = (vec.x ~= 0) and { x = 0, y = 1 } or { x = 1, y = 0 }
+  local first = -math.floor((width - 1) / 2)
+  local tiles = {}
+  for i = 1, length do
+    for j = first, first + width - 1 do
+      tiles[#tiles + 1] = {
+        x = a_tile.x + vec.x * i + perp.x * j,
+        y = a_tile.y + vec.y * i + perp.y * j,
+      }
+    end
   end
+  return tiles
+end
 
-  surface.set_tiles(tiles_to_set)
+--- Place corridor tiles. Never removes entities: the merger has already
+--- checked that these tiles are empty.
+---@param surface LuaSurface  platform A's surface
+---@param tiles table[]
+function Corridor.place_bridge(surface, tiles)
+  if #tiles == 0 then return end
+  local to_set = {}
+  for i, pos in ipairs(tiles) do
+    to_set[i] = { name = "platform-docking-corridor", position = pos }
+  end
+  surface.set_tiles(to_set, true, false)
+  log(string.format("[Corridor] Placed %d corridor tile(s).", #tiles))
+end
 
-  log(string.format("[Corridor] Reverted %d corridor tile(s) to foundation.",
-    #pair.corridor_tiles))
-
-  pair.corridor_tiles = {}
+--- Turn tiles back into empty space. Anything still standing on them is
+--- removed by the engine, so callers clear entities first.
+---@param surface LuaSurface
+---@param tiles table[]
+function Corridor.clear_tiles(surface, tiles)
+  if #tiles == 0 then return end
+  local to_set = {}
+  for i, pos in ipairs(tiles) do
+    to_set[i] = { name = "empty-space", position = pos }
+  end
+  surface.set_tiles(to_set, true, true)
 end
 
 return Corridor
