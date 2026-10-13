@@ -52,8 +52,19 @@ local docking_port_entity = {
   activity_led_light           = _base_cc.activity_led_light,
   activity_led_light_offsets   = _base_cc.activity_led_light_offsets,
   circuit_wire_connection_points = _base_cc.circuit_wire_connection_points,
-  -- Placement restriction (Step 5): add tile_buildability_rules once the
-  -- correct Space Age collision-mask layer name is confirmed in testing.
+  -- Placement: on platform floor, with the docking face (north when unrotated)
+  -- over empty space — same layers the asteroid collector uses. The front rule
+  -- must not remove the port later, because docking lays bridge tiles there.
+  tile_buildability_rules = {
+    { area = { { -0.4, -0.4 }, { 0.4, 0.4 } },
+      required_tiles = { layers = { ground_tile = true } },
+      colliding_tiles = { layers = { empty_space = true } },
+      remove_on_collision = true },
+    { area = { { -0.4, -1.4 }, { 0.4, -0.6 } },
+      required_tiles = { layers = { empty_space = true } },
+      colliding_tiles = { layers = {} },
+      remove_on_collision = false },
+  },
   circuit_wire_max_distance = 9,
 }
 
@@ -167,6 +178,31 @@ local docking_technology = {
   },
 }
 
+-- Carrier Clamps: one host may hold several guests, and guests can launch
+-- while the host is in flight. Both are scripted, hence "nothing" effects.
+-- Costs are placeholders until the balance pass.
+local carrier_technology = {
+  type = "technology",
+  name = "platform-docking-carrier",
+  icon = placeholder_icon,
+  icon_size = placeholder_icon_size,
+  prerequisites = { "platform-docking" },
+  unit = {
+    count = 500,
+    ingredients = {
+      { "automation-science-pack", 1 },
+      { "logistic-science-pack", 1 },
+      { "chemical-science-pack", 1 },
+      { "space-science-pack", 1 },
+    },
+    time = 30,
+  },
+  effects = {
+    { type = "nothing", effect_description = { "modifier-description.platform-docking-multi-guest" } },
+    { type = "nothing", effect_description = { "modifier-description.platform-docking-launch" } },
+  },
+}
+
 -- ---------------------------------------------------------------------------
 -- Register all prototypes
 -- ---------------------------------------------------------------------------
@@ -177,4 +213,5 @@ data:extend({
   hub_overlay_entity,
   docking_port_recipe,
   docking_technology,
+  carrier_technology,
 })

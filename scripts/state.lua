@@ -2,9 +2,14 @@
 -- Global storage schema and helpers.
 --
 -- Schema:
---   storage.docked_pairs     = { [pair_id] = pair }
---   storage.port_to_pair     = { [unit_number] = pair_id }     -- ports A, B and B's clone
---   storage.platform_to_pair = { [platform_index] = pair_id }
+--   storage.docked_pairs       = { [pair_id] = pair }
+--   storage.port_to_pair       = { [unit_number] = pair_id }   -- ports A, B and B's clone
+--   storage.host_paused_before = { [platform_index] = bool }   -- host's paused flag before its
+--                                                               -- first guest (moving disabled)
+--
+-- A host can hold several guests (carrier docking); a guest belongs to one
+-- pair; a platform is never both host and guest. Platform lookups scan
+-- docked_pairs, which only ever holds a handful of records.
 --
 -- Pair record:
 --   platform_a_index, platform_b_index   host (A) and guest (B) platform indices
@@ -17,24 +22,31 @@
 --   footprint                            B's tiles in A's coordinates, hub cluster excluded
 --   hub_hole_tiles                       B's hub cluster tiles in A's coordinates
 --   overlay                              LuaEntity marking B's hub spot on A
---   a_paused_before, b_paused_before     paused flags to restore on undock
+--   b_paused_before                      guest's paused flag to restore on undock
 --   state                                "docking" | "docked" | "undock_pending"
 --   anim_tick                            tick the docking countdown started
 
 local State = {}
 
 function State.init()
-  storage.docked_pairs     = storage.docked_pairs     or {}
-  storage.port_to_pair     = storage.port_to_pair     or {}
-  storage.platform_to_pair = storage.platform_to_pair or {}
-  -- Dropped in the merge/unmerge rework.
+  storage.docked_pairs       = storage.docked_pairs       or {}
+  storage.port_to_pair       = storage.port_to_pair       or {}
+  storage.host_paused_before = storage.host_paused_before or {}
+  -- Dropped in earlier reworks.
   storage.registered_ports = nil
+  storage.platform_to_pair = nil
 
-  -- Pre-rework pair records can't be undocked by the new code; forget them.
   for pair_id, pair in pairs(storage.docked_pairs) do
     if not pair.force_name then
+      -- Pre-rework pair records can't be undocked by the new code; forget them.
       log("[State] Dropping legacy pair record " .. pair_id .. " (undock before updating the mod).")
       State.remove_pair(pair_id)
+    elseif pair.a_paused_before ~= nil then
+      -- Single-guest saves kept the host's paused flag on the pair.
+      if storage.host_paused_before[pair.platform_a_index] == nil then
+        storage.host_paused_before[pair.platform_a_index] = pair.a_paused_before
+      end
+      pair.a_paused_before = nil
     end
   end
 end
@@ -65,8 +77,6 @@ function State.create_pair(platform_a, platform_b, port_a, port_b, length, width
 
   storage.port_to_pair[port_a.unit_number] = pair_id
   storage.port_to_pair[port_b.unit_number] = pair_id
-  storage.platform_to_pair[platform_a.index] = pair_id
-  storage.platform_to_pair[platform_b.index] = pair_id
 
   -- Fires on_object_destroyed however the port goes away (mined, died, script).
   script.register_on_object_destroyed(port_a)
@@ -88,9 +98,6 @@ end
 function State.remove_pair(pair_id)
   local pair = storage.docked_pairs[pair_id]
   if not pair then return end
-
-  storage.platform_to_pair[pair.platform_a_index] = nil
-  storage.platform_to_pair[pair.platform_b_index] = nil
   for unit, id in pairs(storage.port_to_pair) do
     if id == pair_id then storage.port_to_pair[unit] = nil end
   end
@@ -106,13 +113,44 @@ function State.get_pair_for_port(entity)
   return storage.docked_pairs[pair_id], pair_id
 end
 
----@param platform LuaSpacePlatform
----@return table|nil pair, number|nil pair_id
-function State.get_pair_for_platform(platform)
-  if not platform then return nil, nil end
-  local pair_id = storage.platform_to_pair[platform.index]
-  if not pair_id then return nil, nil end
-  return storage.docked_pairs[pair_id], pair_id
+--- Every pair a platform takes part in, as a list of pair ids (sorted, so
+--- iteration order is the same on every machine in multiplayer).
+---@param platform_index number
+---@param except_pair_id number|nil  leave this pair out
+---@return number[] pair_ids
+function State.pair_ids_of(platform_index, except_pair_id)
+  local ids = {}
+  for id, pair in pairs(storage.docked_pairs) do
+    if id ~= except_pair_id
+       and (pair.platform_a_index == platform_index or pair.platform_b_index == platform_index) then
+      ids[#ids + 1] = id
+    end
+  end
+  table.sort(ids)
+  return ids
+end
+
+--- The pair in which this platform is the guest, if any.
+---@param platform_index number
+---@param except_pair_id number|nil
+---@return number|nil pair_id
+function State.guest_pair_id(platform_index, except_pair_id)
+  for id, pair in pairs(storage.docked_pairs) do
+    if id ~= except_pair_id and pair.platform_b_index == platform_index then return id end
+  end
+  return nil
+end
+
+--- How many guests this platform currently hosts (including ones still docking).
+---@param platform_index number
+---@param except_pair_id number|nil
+---@return number
+function State.guest_count(platform_index, except_pair_id)
+  local n = 0
+  for id, pair in pairs(storage.docked_pairs) do
+    if id ~= except_pair_id and pair.platform_a_index == platform_index then n = n + 1 end
+  end
+  return n
 end
 
 --- Resolve a platform by force name + platform index.
@@ -131,6 +169,15 @@ end
 function State.get_platforms(pair)
   return State.get_platform(pair.force_name, pair.platform_a_index),
          State.get_platform(pair.force_name, pair.platform_b_index)
+end
+
+--- Has the force researched Carrier Clamps (multiple guests, in-flight launch)?
+---@param force LuaForce|string
+---@return boolean
+function State.has_carrier(force)
+  if type(force) == "string" then force = game.forces[force] end
+  local tech = force and force.technologies["platform-docking-carrier"]
+  return tech ~= nil and tech.researched
 end
 
 return State

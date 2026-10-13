@@ -22,6 +22,7 @@ local BUTTONS = {
   docking_initiate_btn = true,
   docking_abort_btn    = true,
   docking_undock_btn   = true,
+  docking_launch_btn   = true,
 }
 Gui.BUTTONS = BUTTONS
 
@@ -93,7 +94,8 @@ local function resolve_dock(my_port, target_port, length, width)
   local ok, reason = OrbitCheck.can_platforms_dock(my_platform, target_platform)
   if not ok then return nil, reason end
 
-  local host, guest = OrbitCheck.choose_host(my_platform, target_platform)
+  local host, guest, role_err = OrbitCheck.choose_host(my_platform, target_platform)
+  if not host then return nil, role_err end
   local port_a, port_b = my_port, target_port
   if host.index ~= my_platform.index then port_a, port_b = target_port, my_port end
 
@@ -305,6 +307,19 @@ function Gui._build_docked_content(content, port_entity, pair)
   local in_transit = not (platform_a and platform_a.space_location)
   local btn_flow = content.add{ type = "flow", direction = "horizontal" }
   btn_flow.add{ type = "empty-widget" }.style.horizontally_stretchable = true
+
+  -- Launch is only offered while the host is flying.
+  if in_transit then
+    local can_launch, reason = Merger.can_launch(pair)
+    btn_flow.add{
+      type    = "button",
+      name    = "docking_launch_btn",
+      caption = { "gui.docking-launch" },
+      enabled = can_launch,
+      tooltip = can_launch and { "gui.docking-launch-tooltip" } or reason,
+    }
+  end
+
   btn_flow.add{
     type    = "button",
     name    = "docking_undock_btn",
@@ -413,6 +428,11 @@ function Gui.on_click(player, element)
     local _, pair_id = State.get_pair_for_port(my_port)
     Gui.close(player)
     if pair_id then Merger.request_undock(pair_id) end
+
+  elseif name == "docking_launch_btn" then
+    local _, pair_id = State.get_pair_for_port(my_port)
+    Gui.close(player)
+    if pair_id then Merger.launch(pair_id) end
   end
 end
 

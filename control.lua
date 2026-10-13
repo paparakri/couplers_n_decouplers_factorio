@@ -6,6 +6,7 @@ local State     = require("scripts.state")
 local Gui       = require("scripts.gui")
 local Merger    = require("scripts.merger")
 local Logistics = require("scripts.logistics")
+local Lane      = require("scripts.lane")
 
 -- ---------------------------------------------------------------------------
 -- Initialisation
@@ -23,6 +24,14 @@ script.on_event(defines.events.on_object_destroyed, function(event)
   if event.type ~= defines.target_type.entity then return end
   Merger.on_port_destroyed(event.useful_id)
 end)
+
+-- ---------------------------------------------------------------------------
+-- Bridge lanes — floor built in front of a port is reverted and refunded.
+-- ---------------------------------------------------------------------------
+
+script.on_event(defines.events.on_player_built_tile, Lane.on_tiles_built)
+script.on_event(defines.events.on_robot_built_tile, Lane.on_tiles_built)
+script.on_event(defines.events.on_space_platform_built_tile, Lane.on_tiles_built)
 
 -- ---------------------------------------------------------------------------
 -- GUI
@@ -73,16 +82,12 @@ end)
 
 script.on_event(defines.events.on_space_platform_changed_state, function(event)
   local platform = event.platform
-  if platform and platform.valid then
-    local pair, pair_id = State.get_pair_for_platform(platform)
-    if not pair then return end
-    local before = pair.state
-    Merger.on_platform_state_changed(platform)
-    -- Docking GUIs show pair state; close them if it just changed.
-    if not storage.docked_pairs[pair_id] or pair.state ~= before then
-      Gui.close_all()
-    end
-  end
+  if not (platform and platform.valid) then return end
+  if #State.pair_ids_of(platform.index) == 0 then return end
+  Merger.on_platform_state_changed(platform)
+  -- Docking GUIs show pair state and whether launching is possible (depends
+  -- on the host flying), so close them; reopening shows the current state.
+  Gui.close_all()
 end)
 
 script.on_event(defines.events.on_pre_surface_deleted, function(event)

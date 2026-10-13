@@ -162,10 +162,15 @@ function Merger.plan(platform_a, platform_b, port_a, port_b, length, width)
   -- Every tile B needs on A must currently be empty space.
   local all = concat(concat(footprint, hub_hole), corridor)
   for _, t in ipairs(all) do
-    local name = surface_a.get_tile(t.x, t.y).name
-    -- out-of-map: chunk not generated yet; clone_brush expands the map there.
-    if name ~= "empty-space" and name ~= "out-of-map" then
-      return nil, { "docking-message.overlap" }
+    local tile = surface_a.get_tile(t.x, t.y)
+    -- An invalid tile or "out-of-map" means the chunk isn't generated yet, so
+    -- nothing can be there; clone_brush expands the map. If it can't, the
+    -- clone count check rolls the dock back safely.
+    if tile.valid then
+      local name = tile.name
+      if name ~= "empty-space" and name ~= "out-of-map" then
+        return nil, { "docking-message.overlap" }
+      end
     end
   end
   -- …and nothing may stand there (asteroids drifting through are fine).
@@ -215,8 +220,13 @@ function Merger.execute_merge(pair_id)
   if not (port_a and port_a.valid and port_b and port_b.valid) then
     return fail_merge(pair_id, pair, { "docking-message.port-missing" })
   end
-  local ok, reason = OrbitCheck.can_platforms_dock(platform_a, platform_b, pair_id)
+  local ok, reason = OrbitCheck.can_platforms_dock(platform_a, platform_b)
   if not ok then return fail_merge(pair_id, pair, reason) end
+  local host, _, role_err = OrbitCheck.choose_host(platform_a, platform_b, pair_id)
+  if not host then return fail_merge(pair_id, pair, role_err) end
+  if host.index ~= platform_a.index then
+    return fail_merge(pair_id, pair, { "docking-message.roles-changed" })
+  end
 
   -- 1. Plan + validate. Nothing has changed yet.
   local length, width = Corridor.clamp(pair.corridor_length, pair.corridor_width)
@@ -302,7 +312,10 @@ function Merger.execute_merge(pair_id)
   platform_b.paused = true
   platform_b.hidden = true
   if not settings.global["allow-moving-while-docked"].value then
-    pair.a_paused_before = platform_a.paused
+    -- Remember the host's flag from before its first guest only.
+    if storage.host_paused_before[platform_a.index] == nil then
+      storage.host_paused_before[platform_a.index] = platform_a.paused
+    end
     platform_a.paused = true
   end
 
@@ -317,13 +330,50 @@ end
 -- Unmerge
 -- ---------------------------------------------------------------------------
 
+--- Remove a pair; once the host has no guests left, give it back its paused flag.
+---@param pair_id number
+---@param pair table
+---@param platform_a LuaSpacePlatform|nil
+local function finish_pair(pair_id, pair, platform_a)
+  State.remove_pair(pair_id)
+  local index = pair.platform_a_index
+  if State.guest_count(index) == 0 and storage.host_paused_before[index] ~= nil then
+    if platform_a then platform_a.paused = storage.host_paused_before[index] end
+    storage.host_paused_before[index] = nil
+  end
+end
+
 --- Guest platform is gone: whatever was copied onto A now just belongs to A.
 ---@param pair_id number
 local function abandon(pair_id, pair, platform_a)
   if pair.overlay and pair.overlay.valid then pair.overlay.destroy() end
-  if platform_a and pair.a_paused_before ~= nil then platform_a.paused = pair.a_paused_before end
   notify(pair, { "", { "docking-message.prefix" }, { "docking-message.guest-lost" } })
-  State.remove_pair(pair_id)
+  finish_pair(pair_id, pair, platform_a)
+end
+
+--- Put the guest on the host's route, next to it if the engine allows.
+--- Writing space_connection puts a platform halfway along the route; distance
+--- and speed are then copied from the host where possible.
+---@param platform_a LuaSpacePlatform
+---@param platform_b LuaSpacePlatform
+---@return boolean placed  false if the guest couldn't be put in flight at all
+local function place_in_flight(platform_a, platform_b)
+  local connection = platform_a.space_connection
+  if not connection then return false end
+  syncing = true
+  local ok, err = pcall(function() platform_b.space_connection = connection end)
+  if ok then
+    local ok_d, err_d = pcall(function() platform_b.distance = platform_a.distance end)
+    if not ok_d then log("[Merger] Launch: could not set distance: " .. tostring(err_d)) end
+    local ok_s, err_s = pcall(function() platform_b.speed = platform_a.speed end)
+    if not ok_s then log("[Merger] Launch: could not set speed: " .. tostring(err_s)) end
+    log(string.format("[Merger] Launch: guest on %s at %s (host at %s)",
+      connection.name, tostring(platform_b.distance), tostring(platform_a.distance)))
+  else
+    log("[Merger] Launch: could not set space_connection: " .. tostring(err))
+  end
+  syncing = false
+  return ok
 end
 
 --- Undock now, or as soon as the host stops if it is in transit.
@@ -349,10 +399,44 @@ function Merger.request_undock(pair_id)
   Merger.execute_unmerge(pair_id)
 end
 
+--- Can this pair launch its guest right now?
+---@param pair table
+---@return boolean ok
+---@return LocalisedString|nil reason
+function Merger.can_launch(pair)
+  if pair.state ~= "docked" and pair.state ~= "undock_pending" then
+    return false, { "docking-message.launch-not-docked" }
+  end
+  if not State.has_carrier(pair.force_name) then
+    return false, { "docking-message.launch-needs-carrier" }
+  end
+  local platform_a = State.get_platform(pair.force_name, pair.platform_a_index)
+  if not (platform_a and platform_a.space_connection) then
+    return false, { "docking-message.launch-not-in-flight" }
+  end
+  return true, nil
+end
+
+--- Release the guest while the host is flying; it continues on the same route.
 ---@param pair_id number
----@param now boolean|nil  run even if the host is in transit (host surface being deleted)
 ---@return boolean success
-function Merger.execute_unmerge(pair_id, now)
+function Merger.launch(pair_id)
+  local pair = storage.docked_pairs[pair_id]
+  if not pair then return false end
+  local ok, reason = Merger.can_launch(pair)
+  if not ok then
+    notify(pair, { "", { "docking-message.prefix" }, reason })
+    return false
+  end
+  return Merger.execute_unmerge(pair_id, { launch = true })
+end
+
+---@param pair_id number
+---@param opts table|nil  { now = true } run even if the host is in transit (host surface
+---                       being deleted); { launch = true } release the guest in flight
+---@return boolean success
+function Merger.execute_unmerge(pair_id, opts)
+  opts = opts or {}
   local pair = storage.docked_pairs[pair_id]
   if not pair or not pair.footprint then return false end
 
@@ -364,14 +448,14 @@ function Merger.execute_unmerge(pair_id, now)
       platform_b.hidden = false
       if pair.b_paused_before ~= nil then platform_b.paused = pair.b_paused_before end
     end
-    State.remove_pair(pair_id)
+    finish_pair(pair_id, pair, nil)
     return false
   end
   if not platform_b then
     abandon(pair_id, pair, platform_a)
     return false
   end
-  if not platform_a.space_location and not now then
+  if not platform_a.space_location and not (opts.now or opts.launch) then
     Merger.request_undock(pair_id)
     return false
   end
@@ -382,8 +466,9 @@ function Merger.execute_unmerge(pair_id, now)
   local footprint_set = Footprint.keyset(footprint)
   local back_offset   = { x = -pair.offset.x, y = -pair.offset.y }
 
-  -- 1. B must be where A is before its content goes back.
-  sync_location(platform_a, platform_b)
+  -- 1. B must be where A is before its content goes back (a launch places it
+  --    on A's route afterwards instead).
+  if not opts.launch then sync_location(platform_a, platform_b) end
 
   -- 2. Anything straddling B's footprint edge (corridor, hub hole, A's side)
   --    can't be split between platforms: mine it into A's hub.
@@ -441,15 +526,24 @@ function Merger.execute_unmerge(pair_id, now)
   if pair.overlay and pair.overlay.valid then pair.overlay.destroy() end
   Corridor.clear_tiles(surface_a, concat(concat(footprint, pair.hub_hole_tiles or {}), pair.corridor_tiles or {}))
 
-  -- 6. Hand B back.
+  -- 6. Hand B back. The pair is gone first, so B's own state changes below
+  --    aren't treated as a docked guest trying to move.
+  finish_pair(pair_id, pair, platform_a)
   platform_b.hidden = false
-  if pair.b_paused_before ~= nil then platform_b.paused = pair.b_paused_before end
-  if pair.a_paused_before ~= nil then platform_a.paused = pair.a_paused_before end
   move_players_to_guest(surface_a, platform_b, footprint_set, back_offset)
 
-  log("[Merger] Pair " .. pair_id .. " undocked.")
-  notify(pair, { "", { "docking-message.prefix" }, { "docking-message.undocked", platform_b.name } })
-  State.remove_pair(pair_id)
+  if opts.launch then
+    local in_flight = place_in_flight(platform_a, platform_b)
+    platform_b.paused = false
+    log("[Merger] Pair " .. pair_id .. " launched.")
+    notify(pair, { "", { "docking-message.prefix" },
+      in_flight and { "docking-message.launched", platform_b.name }
+                or { "docking-message.launched-at-stop", platform_b.name } })
+  else
+    if pair.b_paused_before ~= nil then platform_b.paused = pair.b_paused_before end
+    log("[Merger] Pair " .. pair_id .. " undocked.")
+    notify(pair, { "", { "docking-message.prefix" }, { "docking-message.undocked", platform_b.name } })
+  end
   return true
 end
 
@@ -457,41 +551,46 @@ end
 -- Event hooks (called from control.lua)
 -- ---------------------------------------------------------------------------
 
---- A platform in a pair changed state (departed, arrived, paused, ...).
+--- A platform changed state (departed, arrived, paused, ...). Updates every
+--- pair it takes part in.
 ---@param platform LuaSpacePlatform
+---@return boolean changed  true if any pair's state changed or a pair ended
 function Merger.on_platform_state_changed(platform)
-  if syncing then return end
-  local pair, pair_id = State.get_pair_for_platform(platform)
-  if not pair then return end
+  if syncing then return false end
+  local changed = false
 
-  if pair.state == "docking" then
-    if not platform.space_location then
-      notify(pair, { "", { "docking-message.prefix" }, { "docking-message.dock-cancelled" } })
-      State.remove_pair(pair_id)
+  for _, pair_id in ipairs(State.pair_ids_of(platform.index)) do
+    local pair = storage.docked_pairs[pair_id]
+    if pair then
+      local before = pair.state
+      if pair.state == "docking" then
+        if not platform.space_location then
+          notify(pair, { "", { "docking-message.prefix" }, { "docking-message.dock-cancelled" } })
+          State.remove_pair(pair_id)
+        end
+      else
+        local platform_a, platform_b = State.get_platforms(pair)
+        if platform_a and platform_b then
+          if platform.index == pair.platform_b_index then
+            -- The guest must not go anywhere on its own.
+            if not platform_b.paused then platform_b.paused = true end
+            sync_location(platform_a, platform_b)
+          elseif platform_a.space_location then
+            -- Host arrived somewhere.
+            if pair.state == "undock_pending" then
+              Merger.execute_unmerge(pair_id)
+            else
+              sync_location(platform_a, platform_b)
+            end
+          elseif not settings.global["allow-moving-while-docked"].value then
+            Merger.request_undock(pair_id)
+          end
+        end
+      end
+      if not storage.docked_pairs[pair_id] or pair.state ~= before then changed = true end
     end
-    return
   end
-
-  local platform_a, platform_b = State.get_platforms(pair)
-  if not (platform_a and platform_b) then return end
-
-  if platform.index == pair.platform_b_index then
-    -- The guest must not go anywhere on its own.
-    if not platform_b.paused then platform_b.paused = true end
-    sync_location(platform_a, platform_b)
-    return
-  end
-
-  -- Host.
-  if platform_a.space_location then
-    if pair.state == "undock_pending" then
-      Merger.execute_unmerge(pair_id)
-    else
-      sync_location(platform_a, platform_b)
-    end
-  elseif not settings.global["allow-moving-while-docked"].value then
-    Merger.request_undock(pair_id)
-  end
+  return changed
 end
 
 --- A docking port belonging to a pair was destroyed.
@@ -508,16 +607,20 @@ end
 function Merger.on_pre_surface_deleted(surface)
   local platform = surface and surface.platform
   if not platform then return end
-  local pair, pair_id = State.get_pair_for_platform(platform)
-  if not pair then return end
 
-  if pair.state == "docking" then
-    State.remove_pair(pair_id)
-  elseif platform.index == pair.platform_a_index then
-    Merger.execute_unmerge(pair_id, true)
-  else
-    abandon(pair_id, pair, State.get_platform(pair.force_name, pair.platform_a_index))
+  for _, pair_id in ipairs(State.pair_ids_of(platform.index)) do
+    local pair = storage.docked_pairs[pair_id]
+    if pair then
+      if pair.state == "docking" then
+        State.remove_pair(pair_id)
+      elseif platform.index == pair.platform_a_index then
+        Merger.execute_unmerge(pair_id, { now = true })
+      else
+        abandon(pair_id, pair, State.get_platform(pair.force_name, pair.platform_a_index))
+      end
+    end
   end
 end
 
 return Merger
+

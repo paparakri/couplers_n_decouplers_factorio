@@ -18,6 +18,10 @@
   surface. The guest platform stays hidden + paused and follows the host's
   space_location, so docked platforms fly together.
 - Never push to main: .github/workflows/release.yml publishes to the mod portal.
-- Known unfinished parts: placement restriction / build exclusion zone for the
-  port, real art (Step 5). In-game checks still needed: clone_brush offset
-  semantics, writing space_location on the hidden guest.
+- Carrier docking: a host can hold several guests (Carrier Clamps tech);
+  platform lookups scan storage.docked_pairs (State.pair_ids_of). Guests can
+  launch in flight (Merger.launch → execute_unmerge{launch=true}).
+- scripts/lane.lua reverts floor built in front of docking ports.
+- Roadmap: docs/ROADMAP.md. Known unfinished: real art. In-game checks still
+  needed: writing distance/speed on a launched guest, tile_buildability_rules
+  rotating with the port.

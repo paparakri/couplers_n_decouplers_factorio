@@ -1,6 +1,12 @@
 -- scripts/orbit-check.lua
 -- Determines whether two platforms are eligible to dock, picks the host, and
 -- lists compatible targets visible from a given docking port.
+--
+-- Roles: a platform already hosting guests must be the host again (carrier
+-- docking, needs the Carrier Clamps technology). A guest can't dock to
+-- anything else, and a host can't become a guest (no chains).
+
+local State = require("scripts.state")
 
 local OrbitCheck = {}
 
@@ -21,9 +27,8 @@ local OPPOSITE = {
 OrbitCheck.OPPOSITE = OPPOSITE
 
 ---@param platform LuaSpacePlatform
----@param own_pair_id number|nil  a pair this platform may already belong to
 ---@return LocalisedString|nil reason
-local function platform_problem(platform, own_pair_id)
+local function platform_problem(platform)
   if not (platform and platform.valid) then
     return { "docking-message.platform-missing" }
   end
@@ -33,23 +38,16 @@ local function platform_problem(platform, own_pair_id)
   if not platform.space_location then
     return { "docking-message.platform-in-transit", platform.name }
   end
-  local pair_id = storage.platform_to_pair[platform.index]
-  if pair_id and pair_id ~= own_pair_id then
-    return { "docking-message.platform-already-docked", platform.name }
-  end
   return nil
 end
 
---- Returns true if two platforms are eligible to dock, otherwise false and a
---- localised reason.
+--- Location, force and lifecycle checks. Roles are checked by choose_host.
 ---@param platform_a LuaSpacePlatform
 ---@param platform_b LuaSpacePlatform
----@param own_pair_id number|nil  ignore this pair when checking "already docked"
 ---@return boolean can_dock
 ---@return LocalisedString|nil reason
-function OrbitCheck.can_platforms_dock(platform_a, platform_b, own_pair_id)
-  local problem = platform_problem(platform_a, own_pair_id)
-               or platform_problem(platform_b, own_pair_id)
+function OrbitCheck.can_platforms_dock(platform_a, platform_b)
+  local problem = platform_problem(platform_a) or platform_problem(platform_b)
   if problem then return false, problem end
 
   if platform_a.index == platform_b.index then
@@ -72,16 +70,42 @@ local function tile_count(platform)
   return platform.surface.count_tiles_filtered{ name = "empty-space", invert = true }
 end
 
---- The larger platform hosts; the smaller one is copied onto it.
---- Ties go to the platform whose port was opened.
+--- Decide which platform hosts. A platform that already hosts stays the host;
+--- otherwise the larger one hosts (ties go to the platform whose port was opened).
 ---@param opened LuaSpacePlatform
 ---@param other LuaSpacePlatform
----@return LuaSpacePlatform host, LuaSpacePlatform guest
-function OrbitCheck.choose_host(opened, other)
-  if tile_count(other) > tile_count(opened) then
-    return other, opened
+---@param own_pair_id number|nil  ignore this pair (re-checking a dock in progress)
+---@return LuaSpacePlatform|nil host
+---@return LuaSpacePlatform|nil guest
+---@return LocalisedString|nil reason
+function OrbitCheck.choose_host(opened, other, own_pair_id)
+  for _, p in ipairs{ opened, other } do
+    if State.guest_pair_id(p.index, own_pair_id) then
+      return nil, nil, { "docking-message.platform-already-docked", p.name }
+    end
   end
-  return opened, other
+
+  local opened_hosts = State.guest_count(opened.index, own_pair_id) > 0
+  local other_hosts  = State.guest_count(other.index, own_pair_id) > 0
+  if opened_hosts and other_hosts then
+    return nil, nil, { "docking-message.both-hosting" }
+  end
+
+  local host, guest
+  if opened_hosts then
+    host, guest = opened, other
+  elseif other_hosts then
+    host, guest = other, opened
+  elseif tile_count(other) > tile_count(opened) then
+    host, guest = other, opened
+  else
+    host, guest = opened, other
+  end
+
+  if State.guest_count(host.index, own_pair_id) > 0 and not State.has_carrier(host.force) then
+    return nil, nil, { "docking-message.needs-carrier", host.name }
+  end
+  return host, guest, nil
 end
 
 --- Build the list of compatible docking targets visible from a given port.
@@ -98,16 +122,20 @@ function OrbitCheck.get_compatible_platforms(port_entity)
 
   for _, platform in pairs(port_entity.force.platforms) do
     if platform.valid and platform.index ~= my_platform.index
-       and OrbitCheck.can_platforms_dock(my_platform, platform) then
+       and OrbitCheck.can_platforms_dock(my_platform, platform)
+       and OrbitCheck.choose_host(my_platform, platform) then
       for _, port in ipairs(platform.surface.find_entities_filtered{
           name = "docking-port", direction = wanted_dir }) do
-        targets[#targets + 1] = {
-          platform = platform,
-          port     = port,
-          label    = { "gui.docking-target-label", platform.name,
-                       { "gui.docking-dir-" .. (DIRECTION_NAMES[port.direction] or "unknown") },
-                       string.format("%d, %d", math.floor(port.position.x), math.floor(port.position.y)) },
-        }
+        -- Ports already in a pair (including guests' ports cloned onto a host) are busy.
+        if not storage.port_to_pair[port.unit_number] then
+          targets[#targets + 1] = {
+            platform = platform,
+            port     = port,
+            label    = { "gui.docking-target-label", platform.name,
+                         { "gui.docking-dir-" .. (DIRECTION_NAMES[port.direction] or "unknown") },
+                         string.format("%d, %d", math.floor(port.position.x), math.floor(port.position.y)) },
+          }
+        end
       end
     end
   end

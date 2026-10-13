@@ -4,10 +4,11 @@ A Factorio 2.0 / Space Age mod that lets two space platforms parked at the same 
 
 ## How it works
 
-1. Research **Platform Docking** (space science) and build a **Docking Port** on the edge of each platform. The two ports must face each other (e.g. one east, one west); the target list only shows ports that do.
+1. Research **Platform Docking** (space science) and build a **Docking Port** on the edge of each platform, its docking face over empty space. Floor built in the lane in front of a port is refunded so the bridge always has room. The two ports must face each other (e.g. one east, one west); the target list only shows ports that do.
 2. Open a port, pick a target port, and set the walkway's **length** and **width**. The preview line shows which platform hosts and whether it fits.
 3. Press **Initiate Docking**. After a short countdown the smaller platform (the guest) is copied onto the larger one (the host), joined by the walkway. The guest's hub stays behind, marked by an overlay. Anyone viewing the guest is moved to the host.
 4. While docked, the host can fly and carries the guest with it. The two hubs fill each other's logistic requests.
+   - With **Carrier Clamps** researched, a host can carry several guests (one per port) and **Launch** a guest while flying: it leaves on the same route with its own schedule.
 5. Press **Undock** on either port to split them again. Players viewing the guest's part go back with it. If the host is in transit, undocking finishes when it next stops. Anything built across the walkway goes into the host's hub.
 
 Docking checks that the guest fits before changing anything, and both docking and undocking verify every entity was copied before removing the originals. If something doesn't match, nothing is lost: docking rolls back, and undocking leaves the platforms docked.
